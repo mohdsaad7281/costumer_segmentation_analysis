@@ -1,0 +1,154 @@
+-- ============================================================
+-- Experiment 2: A/B Test — Simulated Win-Back Campaign
+-- Builds on Experiment 1's retail_clean table.
+-- Tests whether a win-back campaign increases reactivation among 
+-- At-Risk/Hibernating customers, using a real historical baseline 
+-- and a simulated campaign uplift.
+-- ============================================================
+
+
+-- ------------------------------------------------------------
+-- STEP 0: Index for performance (speeds up date-range lookups 
+-- on the large retail_clean table)
+-- ------------------------------------------------------------
+CREATE INDEX idx_customer_date ON retail_clean(CustomerID(20), InvoiceDate);
+
+
+-- ------------------------------------------------------------
+-- STEP 1: Recalculate RFM segments as of a cutoff date 
+-- (2011-06-05), using only transactions before that date.
+-- This lets us later check if these customers naturally 
+-- reactivated in the following 6-month holdout window.
+-- ------------------------------------------------------------
+
+-- 1a. RFM base (Recency, Frequency, Monetary) as of cutoff
+DROP TABLE IF EXISTS rfm_base_cutoff;
+CREATE TABLE rfm_base_cutoff AS
+SELECT
+    CustomerID, Country,
+    DATEDIFF('2011-06-05', MAX(InvoiceDate)) AS Recency,
+    COUNT(DISTINCT Invoice) AS Frequency,
+    ROUND(SUM(Quantity * Price), 2) AS Monetary
+FROM retail_clean
+WHERE InvoiceDate < '2011-06-05'
+GROUP BY CustomerID, Country;
+
+-- 1b. RFM scores (quartile ranking) as of cutoff
+DROP TABLE IF EXISTS rfm_scores_cutoff;
+CREATE TABLE rfm_scores_cutoff AS
+SELECT
+    CustomerID, Country, Recency, Frequency, Monetary,
+    NTILE(4) OVER (ORDER BY Recency DESC) AS R_Score,
+    NTILE(4) OVER (ORDER BY Frequency ASC) AS F_Score,
+    NTILE(4) OVER (ORDER BY Monetary ASC) AS M_Score
+FROM rfm_base_cutoff;
+
+-- 1c. Final segments as of cutoff
+DROP TABLE IF EXISTS rfm_segments_cutoff;
+CREATE TABLE rfm_segments_cutoff AS
+SELECT
+    CustomerID, Country, Recency, Frequency, Monetary,
+    R_Score, F_Score, M_Score,
+    (R_Score + F_Score + M_Score) AS RFM_Total,
+    CASE
+        WHEN (R_Score + F_Score + M_Score) >= 10 THEN 'Champions'
+        WHEN (R_Score + F_Score + M_Score) >= 8 THEN 'Loyal Customers'
+        WHEN (R_Score + F_Score + M_Score) >= 6 THEN 'Potential Loyalists'
+        WHEN (R_Score + F_Score + M_Score) >= 5 THEN 'At Risk'
+        WHEN (R_Score + F_Score + M_Score) >= 4 THEN 'Hibernating'
+        ELSE 'Lost'
+    END AS Segment
+FROM rfm_scores_cutoff;
+
+-- Sanity check: segment counts as of cutoff
+SELECT Segment, COUNT(*) AS customer_count
+FROM rfm_segments_cutoff
+GROUP BY Segment;
+
+
+-- ------------------------------------------------------------
+-- STEP 2: Calculate the REAL baseline reactivation rate.
+-- Check which At-Risk/Hibernating customers (as of cutoff) 
+-- naturally made a purchase in the 6-month holdout window, 
+-- with zero campaign intervention.
+-- ------------------------------------------------------------
+
+-- 2a. Customers who purchased anything in the holdout window
+DROP TABLE IF EXISTS holdout_purchasers;
+CREATE TABLE holdout_purchasers AS
+SELECT DISTINCT CustomerID
+FROM retail_clean
+WHERE InvoiceDate >= '2011-06-05'
+AND InvoiceDate < '2011-12-05';
+
+-- 2b. Flag each At-Risk/Hibernating customer as reactivated or not
+DROP TABLE IF EXISTS reactivation_check;
+CREATE TABLE reactivation_check AS
+SELECT
+    s.CustomerID,
+    s.Segment,
+    CASE WHEN h.CustomerID IS NOT NULL THEN 1 ELSE 0 END AS Reactivated
+FROM rfm_segments_cutoff s
+LEFT JOIN holdout_purchasers h ON s.CustomerID = h.CustomerID
+WHERE s.Segment IN ('At Risk', 'Hibernating');
+
+-- Real baseline reactivation rate by segment
+SELECT 
+    Segment,
+    COUNT(*) AS total_customers,
+    SUM(Reactivated) AS reactivated_count,
+    ROUND(SUM(Reactivated) * 100.0 / COUNT(*), 2) AS reactivation_rate_pct
+FROM reactivation_check
+GROUP BY Segment
+
+UNION ALL
+
+SELECT 
+    'Combined (At Risk + Hibernating)' AS Segment,
+    COUNT(*) AS total_customers,
+    SUM(Reactivated) AS reactivated_count,
+    ROUND(SUM(Reactivated) * 100.0 / COUNT(*), 2) AS reactivation_rate_pct
+FROM reactivation_check;
+
+-- Result: Combined real baseline = 27.98% (897 customers, 251 reactivated)
+
+
+-- ------------------------------------------------------------
+-- STEP 3: Random assignment into Control / Treatment groups
+-- ------------------------------------------------------------
+DROP TABLE IF EXISTS experiment_assignment;
+CREATE TABLE experiment_assignment AS
+SELECT 
+    CustomerID, Segment,
+    CASE WHEN RAND() < 0.5 THEN 'Control' ELSE 'Treatment' END AS Group_Type
+FROM reactivation_check;
+
+
+-- ------------------------------------------------------------
+-- STEP 4: Simulate campaign outcomes.
+-- Control uses the real 27.98% baseline. Treatment applies a 
+-- simulated uplift (~1.36x) based on typical win-back campaign 
+-- performance, since no real campaign data exists in this dataset.
+-- ------------------------------------------------------------
+DROP TABLE IF EXISTS experiment_results;
+CREATE TABLE experiment_results AS
+SELECT 
+    e.CustomerID, e.Segment, e.Group_Type,
+    CASE 
+        WHEN e.Group_Type = 'Control' AND RAND() < 0.2798 THEN 1
+        WHEN e.Group_Type = 'Treatment' AND RAND() < 0.38 THEN 1
+        ELSE 0 
+    END AS Reactivated
+FROM experiment_assignment e;
+
+-- Final experiment results summary
+SELECT 
+    Group_Type,
+    COUNT(*) AS total_customers,
+    SUM(Reactivated) AS reactivated_count,
+    ROUND(SUM(Reactivated) * 100.0 / COUNT(*), 2) AS reactivation_rate_pct
+FROM experiment_results
+GROUP BY Group_Type;
+
+-- Result: Control = 30.87% (447 customers), Treatment = 39.78% (450 customers)
+-- Exported to experiment_results.csv for chi-square significance testing in Python
